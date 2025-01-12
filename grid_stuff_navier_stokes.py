@@ -6,11 +6,12 @@ Created on Sat Jul 13 19:05:00 2024
 """
 import numpy as np
 import cupy as cp
+import pyvista as pv
 import scipy.sparse as sps
 
 
-class FDGrid3D:
-    def __init__(self, shape, dimensions, center, dim=3):
+class EulerianGrid3D:
+    def __init__(self, shape, scale, center):
         """
         Class for a simple cubical grid for implementing the finite difference
         method.
@@ -32,145 +33,134 @@ class FDGrid3D:
 
         """
         self.shape = shape
-        self.dimensions = dimensions
+        self.scale = scale
         
         # Extracting 1d values from each 3d input.
         self.n_x, self.n_y, self.n_z = self.shape
-        self.num_cells = self.n_x * self.n_y * self.n_z
+        self.num_cells = self.n_x * self.n_y * self.n_z     
+        self.del_x, self.del_y, self.del_z = self.scale
+        
+        # Primal Grid Variables
+        self.p = np.zeros(shape) # Pressure
+        self.d = np.zeros(shape) # Advected quantity (for visuals)
+        
+        self.div = np.zeros(shape) # divergence of velocity field
 
-        self.l_x, self.l_y, self.l_z = self.dimensions
+        # Dual Grid Variables
+        self.u = np.zeros((self.n_x+1, self.n_y, self.n_z)) # x vel
+        self.v = np.zeros((self.n_x, self.n_y+1, self.n_z)) # y vel
+        self.w = np.zeros((self.n_x, self.n_y, self.n_z+1)) # z vel
+
+        # Boundary masking variables for dual mesh.
+        self.x_boundary = np.ones(self.u.shape).astype(bool)
+        self.x_boundary[1:-1,:,:] = False
+
+        self.y_boundary = np.ones(self.u.shape).astype(bool)
+        self.y_boundary[:,1:-1,:] = False
+
+        self.z_boundary = np.ones(self.u.shape).astype(bool)
+        self.z_boundary[:,:,1:-1] = False
         
         # Length of each cell.
-        self.del_x = self.l_x / self.n_x
-        self.del_y = self.l_y / self.n_y
-        self.del_z = self.l_z / self.n_z
-        
-        # A boundary cell is placed on each end to account for boundary conds.
-        # These parameters keep track of cell data including boundary.
-        self.n_x_bd = self.n_x + 2
-        self.n_y_bd = self.n_y + 2
-        self.n_z_bd = self.n_z + 2
-
-        self.num_cells_bd = self.n_x_bd * self.n_y_bd * self.n_z_bd
-
-        self.l_x_bd = self.l_x + 2 * self.del_x
-        self.l_y_bd = self.l_y + 2 * self.del_y
-        self.l_z_bd = self.l_z + 2 * self.del_z
+        self.l_x = self.del_x * self.n_x
+        self.l_y = self.del_y * self.n_y
+        self.l_z = self.del_z * self.n_z
 
         # Shortcut for indexing the grid.
         self.i, self.j, self.k = np.indices(self.shape)
-        self.i_bd, self.j_bd, self.k_bd = np.indices(self.shape_bd)
-
-        # Shortcut for indexing forward and backward shifts.
-        self.cent = np.s_[1:self.n_x_bd-1, 1:self.n_y_bd-1, 1:self.n_z_bd-1]        
-
-        self.x_b = np.s_[0:self.n_x, 1:self.n_y_bd-1, 1:self.n_z_bd-1]
-        self.x_f = np.s_[2:self.n_x_bd, 1:self.n_y_bd-1, 1:self.n_z_bd-1]
-        self.y_b = np.s_[1:self.n_x_bd-1, 0:self.n_y, 1:self.n_z_bd-1]
-        self.y_f = np.s_[1:self.n_x_bd-1, 2:self.n_y_bd, 1:self.n_z_bd-1]
-        self.z_b = np.s_[1:self.n_x_bd-1, 1:self.n_y_bd-1, 0:self.n_z]
-        self.z_f = np.s_[1:self.n_x_bd-1, 1:self.n_y_bd-1, 2:self.n_z_bd]
         
-    def thicken(self, f):
-        # If f is in flat form, reshape to the grid shape.
-
-        if f.shape == self.num_cells_bd:
-            f = f.reshape(self.shape_bd)  # Should almost always be this size.
-        if f.shape == self.num_cells:
-            f = f.reshape(self.shape)
-        else:
-            print("Unexpected length of function.")
-
+        # Vars for interacting with the GUI.
+        self.shape_bd = (self.n_x+1, self.n_y+1, self.n_z+1)   
+        self.i_bd, self.j_bd, self.k_bd = np.indices(self.shape_bd)
+        
+        # self.laplace_mat = self.get_laplace_matrix()
 
     def partial_x(self, f):
         # The centered finite difference x partial derivative on the interior.
-        f_x = ((f[self.x_f] + f[self.x_b] - 2 * f[self.cent])
-               / self.del_x ** 2)
+        f_x = (f[1:,:,:]- f[:-1,:,:]) / self.del_x 
         return f_x
     
     def partial_y(self, f):
         # The centered finite difference y partial derivative on interior.
-        f_y = ((f[self.y_f] + f[self.y_b] - 2 * f[self.cent])
-               / self.del_y ** 2)
+        f_y = (f[:,1:,:]- f[:,:-1,:]) / self.del_y 
         return f_y
     
     def partial_z(self, f):
         # The centered finite difference z partial derivative on the interior.
-        f_z = ((f[self.z_f] + f[self.z_b] - 2 * f[self.cent])
-               / self.del_z ** 2)
+        f_z = (f[:,:,1:]- f[:,:,:-1]) / self.del_z 
         return f_z
     
-    def grad(self, f):
-        # The gradient on the interior
-        f_x = self.partial_x(f)
-        f_y = self.partial_y(f)
-        f_z = self.partial_z(f)
-       
-        return f_x, f_y, f_z
-    
     def div(self, u, v, w):
-        # The divergence on the interior.
+        # The divergence operator that maps boundary to centers.
         u_x = self.partial_x(u)
         v_y = self.partial_y(v)
         w_z = self.partial_z(w)
         return u_x + v_y + w_z
 
-    def get_diffusion_matrix(self):
-
-        no_shift = sps.eye(self.num_cells_bd)
-
-        shift_x_up = sps.eye(self.num_cells_bd, k=self.n_y_bd*self.n_z_bd)
-        shift_x_down = sps.eye(self.num_cells_bd, k=-self.n_y_bd*self.n_z_bd)
-
-        y_diag_tile = ([1] * (self.n_y_bd - 1) * self.n_z_bd + 
-                       [0] * self.n_z_bd)
-        shift_y_diag = np.tile(y_diag_tile, self.n_x_bd)
-        shift_y_diag = shift_y_diag[:-self.n_z_bd]
-        shift_y_up = sps.diags(shift_y_diag, offsets=self.n_z_bd)
-        shift_y_down = sps.diags(shift_y_diag, offsets=-self.n_z_bd)
-
-        z_diag_tile = [1] * (self.n_z_bd - 1) + [0]
-        shift_z_diag = np.tile(z_diag_tile, self.n_y_bd*self.n_z_bd)
-        shift_z_diag = shift_z_diag[:-1]
-        shift_z_up = sps.diags(shift_z_diag, offsets=1)
-        shift_z_down = sps.diags(shift_z_diag, offsets=-1)
+    def get_laplace_matrix(self):
+        # TODO: Create laplacian matrix.
         
-        self.diff_mat = (-6 * no_shift 
-                         + shift_x_up 
-                         + shift_x_down 
-                         + shift_y_up 
-                         + shift_y_down 
-                         + shift_z_down 
-                         + shift_z_up)
-        return self.diff_mat
+        return self.laplace_mat
 
-    def add_source(source, dt):
+class StableFluidSolver:
+    def __init__(self, grid, d_0, u_0, v_0, w_0, dt):
+        self.grid = grid
+        self.dt = dt
+        
+        self.d = d_0  # density
+        
+        self.u = u_0  # x - velocity
+        self.v = v_0  # y - velocity
+        self.w = w_0  # z - velocity
+        
+        self.div = np.zeros(grid.cent)
+        self.p = np.zeros(grid.cent)
+        
+        # Masking variables for primal mesh.
+        self.solid = None
+        self.empty = None
+        
+        self.visc = 0
+        self.diff_coeff = 0
+
+        # self.diffusion = (sps.eye(self.grid.num_cells_bd)
+        #                   - self.visc * self.dt * self.grid.laplace_mat)
+        
+        # self.laplacian = self.grid.laplace_mat
+    
+    def add_source(self, f, f_source):
         # method adds dt amount of the source grid to the grid.
-        pass
+        f = f + f_source * self.dt
+        return f
+    
+    def diffuse(self, f):
+        if len(f.shape) != 1:
+            f = f.flatten()
 
-    def diffuse(dens, dens_prev, dt, diff):
-        pass
-
+        solution, _ = sps.linalg.bicg(self.diffusion, f)
+        solution = solution.reshape(self.grid.shape_bd)
+        return solution
+    
     def advect(self, f_0, u, v, w, dt):
-        f = np.zeros(self.shape)
-
+        f = np.zeros(self.grid.shape)
+    
         # Backtrace by the vector field * dt
-        x = self.i_bd - dt * self.n_x_bd / self.l_x_bd * u
-        y = self.j_bd - dt * self.n_y_bd / self.l_y_bd * v
-        z = self.k_bd - dt * self.n_z_bd / self.l_z_bd * w
-
+        x = self.grid.i_bd - dt * self.grid.n_x_bd / self.grid.l_x_bd * u
+        y = self.grid.j_bd - dt * self.grid.n_y_bd / self.grid.l_y_bd * v
+        z = self.grid.k_bd - dt * self.grid.n_z_bd / self.grid.l_z_bd * w
+    
         # Linear interpolation setup
         x[x < 0.5] = 0.5
         y[y < 0.5] = 0.5
         z[z < 0.5] = 0.5
-
-        x[x > self.n_x + 0.5] = self.n_x + 0.5
-        y[y > self.n_y + 0.5] = self.n_y + 0.5
-        z[z > self.n_z + 0.5] = self.n_z + 0.5
-
-        i_0 = np.floor(x)
-        j_0 = np.floor(y)
-        k_0 = np.floor(z)
+    
+        x[x > self.grid.n_x + 0.5] = self.grid.n_x + 0.5
+        y[y > self.grid.n_y + 0.5] = self.grid.n_y + 0.5
+        z[z > self.grid.n_z + 0.5] = self.grid.n_z + 0.5
+    
+        i_0 = np.floor(x).astype(int)
+        j_0 = np.floor(y).astype(int)
+        k_0 = np.floor(z).astype(int)
         
         i_1 = i_0 + 1
         j_1 = j_0 + 1
@@ -193,14 +183,92 @@ class FDGrid3D:
                       + s_1 * (t_0 * f_0[i_1, j_1, k_0]
                                + t_1 * f_0[i_1, i_1, j_1])))
         return f
-        
-    def project(grid):
-        pass
+
+    def compute_divergence(self, u, v, w):
+        div = np.zeros(self.grid.shape_bd)
+        div[self.grid.cent] = self.grid.div(u, v, w)
+        return div
     
-    def set_boundary()
-        pass
-def density_iteration(source, dens, dens_prev, dt, diff):
-    pass
+    def project(self, u, v, w):
+        div = compute_divergence(u, v, w)
+
+        # Solve the pressure Poisson equation
+        q, _ = sps.linalg.bicg(self.laplacian, div)
+        q = q.reshape(self.grid.shape_bd)
+
+        # Take gradient of pressure (solution of PPE)
+        q_x, q_y, q_z = self.grid.grad(q)
+
+        # Correct velocity term using gradient of pressure. 
+        u_proj = u - q_x
+        v_proj = v - q_y
+        w_proj = w - q_z
+        
+        return u_proj, v_proj, w_proj
+    
+    def set_dirichlet_boundary(self):
+
+        self.u[0, :, :] = self.u[1, :, :]
+        self.u[:, 0, :] = self.u[:, 1, :]
+        self.u[:, :, 0] = self.u[:, :, 1]
+        
+        self.u[-1, :, :] = self.u[-2, :, :]
+        self.u[:, -1, :] = self.u[:, -2, :]
+        self.u[:, :, -1] = self.u[:, :, -2]
+        
+        self.v[0, :, :] = self.v[1, :, :]
+        self.v[:, 0, :] = self.v[:, 1, :]
+        self.v[:, :, 0] = self.v[:, :, 1]
+        
+        self.v[-1, :, :] = self.v[-2, :, :]
+        self.v[:, -1, :] = self.v[:, -2, :]
+        self.v[:, :, -1] = self.v[:, :, -2]
+        
+        self.w[0, :, :] = self.w[1, :, :]
+        self.w[:, 0, :] = self.w[:, 1, :]
+        self.w[:, :, 0] = self.w[:, :, 1]
+        
+        self.w[-1, :, :] = self.w[-2, :, :]
+        self.w[:, -1, :] = self.w[:, -2, :]
+        self.w[:, :, -1] = self.w[:, :, -2]
+
+    def step(self):
+        self.u = self.add_source(self.u, self.u_source)
+        self.v = self.add_source(self.v, self.v_source)
+        self.w = self.add_source(self.w, self.w_source)
+
+        self.u = self.advect(self.u, self.u, self.v, self.w, self.dt)
+        self.v = self.advect(self.v, self.u, self.v, self.w, self.dt)
+        self.w = self.advect(self.w, self.u, self.v, self.w, self.dt)
+
+        self.u = self.diffuse(self.u)
+        self.v = self.diffuse(self.v)
+        self.w = self.diffuse(self.w)
+        
+        self.u, self.v, self.w = self.project(self.u, self.v, self.w)
+
+        self.d = self.add_source(self.d, self.d_source)
+        self.d = self.advect(self.d, self.u, self.v, self.w, self.dt)
+        self.d = self.diffuse(self.d)
+        
+        self.set_neumann_boundary()
+
 
 if __name__ == "__main__":
-    grid = Grid((3, 3, 3), (3, 3, 3))
+    grid = EulerianGrid3D((3, 3, 3), (1/3, 1/3, 1/3), (1,1,1))
+
+    d_0 = 1 * np.ones(grid.shape)
+
+    u_0 = np.zeros(grid.u.shape)
+    v_0 = np.zeros(grid.v.shape)
+    w_0 = np.zeros(grid.w.shape)
+    
+    u_0[1,1,1] = 1
+    v_0[1,1,1] = 1
+    w_0[1,1,1] = 1
+    dt = .001
+    
+    plot_test = np.zeros((3,3,3)) 
+    plot_test[1,1,1] = 10
+
+    solver = StableFluidSolver(grid, d_0, u_0, v_0, w_0, dt)
